@@ -3,6 +3,9 @@ from datetime import datetime
 import json
 import logging
 import os
+import time
+
+from collections import deque
 from pathlib import Path, PurePosixPath
 
 from dotenv import load_dotenv
@@ -73,14 +76,84 @@ def list_session_files(client: ExplorerClient, session_path: str) -> list[dict]:
     return sorted(files, key=lambda file: file["s3_path"])
 
 
+def download_session(client: ExplorerClient, session_name: str, bucket, batch_size: int = 25,) -> dict:
+    # get all matching files for this session
+    files = list_session_files(client, session_name)
 
+    logger.info("Preparing to download %s files", len(files))
 
+    result = {
+        "session": session_name,
+        "files_found": len(files),
+        "uploaded": 0,
+        "failed": 0,
+        "bytes_uploaded": 0,
+    }
 
-def download_session(client: ExplorerClient, session_name: str, bucket) -> dict:
-    pass
-    # Download links for their s3_path values using download_files_via_links_v1 endpoint
-    # Transfer to bucket
+    # track download-link API calls for rate limiting (5 calls per 30 seconds)
+    recent_calls = deque(maxlen=5)
 
+    with requests.Session() as download_http:
+        # request download links in batches
+        for start in range(0, len(files), batch_size):
+            batch = files[start : start + batch_size]
+            paths = [file["s3_path"] for file in batch]
+
+            # max 5 link requests every 30 seconds
+            if len(recent_calls) == 5:
+                elapsed = time.monotonic() - recent_calls[0]
+                if elapsed < 30.1:
+                    time.sleep(30.1 - elapsed)
+
+            recent_calls.append(time.monotonic())
+
+            links = client.download_files_via_links(paths)
+
+            # download each file and upload it to our bucket
+            for file in batch:
+                s3_path = file["s3_path"]
+                url = links.get(s3_path)
+
+                if not url:
+                    logger.error("No download URL for %s", s3_path)
+                    result["failed"] += 1
+                    continue
+
+                try:
+                    logger.info("Transferring %s", s3_path)
+
+                    with download_http.get(
+                        url,
+                        stream=True,
+                        timeout=(15, 120),
+                    ) as response:
+                        response.raise_for_status()
+                        response.raw.decode_content = True
+
+                        # preserve original source folder structure
+                        bucket.upload_fileobj(
+                            response.raw,
+                            s3_path,
+                        )
+
+                    result["uploaded"] += 1
+                    result["bytes_uploaded"] += int(file["size"] or 0)
+
+                except Exception as error:
+                    logger.error(
+                        "Failed to transfer %s: %s",
+                        s3_path,
+                        error,
+                    )
+                    result["failed"] += 1
+
+    logger.info(
+        "Session complete: %s uploaded, %s failed",
+        result["uploaded"],
+        result["failed"],
+    )
+
+    return result
 
 
 def main(argv=None) -> int:
@@ -100,7 +173,7 @@ def main(argv=None) -> int:
         parser.error("--season must be a four-digit source directory year")
 
     logging.basicConfig(level=logging.INFO)
-    
+
     load_dotenv(PROJECT_DIR / ".env")
     api_key = os.getenv("KINATRAX_API_KEY", "")
     base_url = os.getenv("KINATRAX_BASE_URL", "https://explorer-api.kinatrax.com")
@@ -114,7 +187,7 @@ def main(argv=None) -> int:
                 result = client.list_folder(args.path)
             print(json.dumps(result, indent=2))
         return 0
-    
+
     except requests.HTTPError as error:
         logger.error("Explorer request failed (HTTP %s).", error.response.status_code)
     except requests.RequestException:

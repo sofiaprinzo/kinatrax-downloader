@@ -45,7 +45,6 @@ class ExplorerClient:
             raise
         return response
 
-
     # Fetch the folders and files directly inside the requested path
     # Return their listing and file metadata without entering subfolders yet
     def list_folder(self, path: str) -> dict:
@@ -54,9 +53,13 @@ class ExplorerClient:
 
         if not isinstance(listing, dict):
             raise TypeError(f"Expected a dictionary for folder listing, but received {type(listing).__name__}.")
-        
+
         missing_keys = {"folders", "files", "metadata", "has_more"} - listing.keys()
         if missing_keys:
             raise ValueError(f"Missing listing fields: {', '.join(sorted(missing_keys))}")
-            
+
         return listing
+
+    def download_files_via_links(self, paths: list[str]) -> dict[str, str]:
+        # Request signed download URLs from KinaTrax. Returns: Mapping of original S3 paths to signed URLs.
+        return
