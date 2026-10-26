@@ -30,9 +30,12 @@ class ExplorerClient:
         self.last_request = time.monotonic()
 
         response = self.http.post(
-            f"{self.base_url}/ktx_s3/{endpoint}", data={"access_token": self.api_key, **parameters},
-            timeout=REQUEST_TIMEOUT, allow_redirects=False,
+            f"{self.base_url}/ktx_s3/{endpoint}",
+            data={"access_token": self.api_key, **parameters},
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
         )
+
         try:
             response.raise_for_status()
             if response.status_code != 200:

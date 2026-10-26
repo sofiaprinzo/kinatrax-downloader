@@ -1,10 +1,3 @@
-# List session folders function only so far
-
-# Extraction and download steps come next:
-# Request download links using POST /ktx_s3/download_files_via_links_v1
-# Send multiple file paths per call to reduce waiting under the 5-calls/30-seconds limit
-# Download files from those links into staging/raw/, preserve folder structure
-
 import argparse
 from datetime import datetime
 import json
@@ -23,7 +16,8 @@ PROJECT_DIR = Path(__file__).resolve().parent
 SOURCE_ROOT = "Data/CPS"
 SESSION_FORMAT = "%Y_%m_%d_%H_%M_%S"
 
-DATA_EXTENSIONS = {".csv", ".txt", ".xml", ".json"}
+DATA_EXTENSIONS = {".csv", ".txt", ".xml"}
+EXCLUDED_FILENAMES = {"cameras.xml", "motion_sequence_batting.csv", "generate_subject_model_properties.xml"}
 
 
 def parse_session_name(name: str) -> datetime:
@@ -40,12 +34,53 @@ def list_sessions(client: ExplorerClient, season: int) -> list[str]:
         try:
             parse_session_name(PurePosixPath(folder).name)
         except ValueError:
-            # Skip folders whose names are not valid session timestamps
             continue
         sessions.append(folder)
     return sorted(set(sessions))
 
-# Next def (list_session_files) to to visit each session's Batting/Pitching subfolder
+# Find the data files inside each Pitching and Batting capture folder
+def list_session_files(client: ExplorerClient, session_path: str) -> list[dict]:
+    session = PurePosixPath(session_path)
+    captures = []
+    logger.info("Listing session: %s", session.name)
+    session_listing = client.list_folder(f"{session}/")
+    for activity_path in sorted(session_listing["folders"]):
+        activity = PurePosixPath(activity_path)
+        if activity.name in {"Pitching", "Batting"}:
+            logger.info("Listing activity: %s", activity.name)
+            activity_listing = client.list_folder(f"{activity}/")
+            captures.extend(activity_listing["folders"])
+
+    # Only check files directly inside the capture folder, not its subfolders. The subfolders only have video files
+    files = []
+    logger.info("Found %s capture folders", len(captures))
+    for capture_path in sorted(captures):
+        capture = PurePosixPath(capture_path)
+        logger.info("Listing capture: %s", capture.name)
+        listing = client.list_folder(f"{capture}/")
+        metadata_by_path = listing["metadata"]
+        for file_path in listing["files"]:
+            path = PurePosixPath(file_path)
+            if path.suffix.lower() in DATA_EXTENSIONS and path.name not in EXCLUDED_FILENAMES:
+                metadata = metadata_by_path.get(file_path, {})
+                files.append({
+                    "s3_path": file_path,
+                    "size": metadata.get("size"),
+                    "last_modified": metadata.get("last_modified"),
+                })
+
+    logger.info("Found %s matching data files", len(files))
+    return sorted(files, key=lambda file: file["s3_path"])
+
+
+
+
+
+def download_session(client: ExplorerClient, session_name: str, bucket) -> dict:
+    pass
+    # Download links for their s3_path values using download_files_via_links_v1 endpoint
+    # Transfer to bucket
+
 
 
 def main(argv=None) -> int:
@@ -58,14 +93,13 @@ def main(argv=None) -> int:
 
     # Show one folder's immediate folders, files, and file metadata
     # Ex: run 'python3 kinatrax_pipeline.py --path Data/CPS/2026/'
-    # Files will show as empty here, so next would be to implement list_session_files()
     commands.add_argument("--path")
 
     args = parser.parse_args(argv)
     if args.season is not None and not 1000 <= args.season <= 9999:
         parser.error("--season must be a four-digit source directory year")
 
-    logging.basicConfig()
+    logging.basicConfig(level=logging.INFO)
     
     load_dotenv(PROJECT_DIR / ".env")
     api_key = os.getenv("KINATRAX_API_KEY", "")
