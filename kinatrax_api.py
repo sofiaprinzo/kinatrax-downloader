@@ -4,7 +4,7 @@ import time
 from pathlib import PurePosixPath
 
 import requests
-
+import json
 
 REQUEST_INTERVAL = 6.1  # Account limit says 5 calls per 30 seconds, added +0.1s for safety
 REQUEST_TIMEOUT = 30
@@ -60,6 +60,17 @@ class ExplorerClient:
 
         return listing
 
-    def download_files_via_links(self, paths: list[str]) -> dict[str, str]:
-        # Request signed download URLs from KinaTrax. Returns: Mapping of original S3 paths to signed URLs.
-        return
+
+def download_files_via_links(self, paths: list[str]) -> dict:
+    # No files to request
+    if not paths:
+        return {}
+
+    # Ask KinaTrax for temporary download URLs
+    with self.request(
+        "download_files_via_links_v1",
+        paths=json.dumps(paths),
+    ) as response:
+        links = response.json()
+
+    return links

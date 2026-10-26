@@ -3,9 +3,7 @@ from datetime import datetime
 import json
 import logging
 import os
-import time
 
-from collections import deque
 from pathlib import Path, PurePosixPath
 
 from dotenv import load_dotenv
@@ -90,22 +88,11 @@ def download_session(client: ExplorerClient, session_name: str, bucket, batch_si
         "bytes_uploaded": 0,
     }
 
-    # track download-link API calls for rate limiting (5 calls per 30 seconds)
-    recent_calls = deque(maxlen=5)
-
     with requests.Session() as download_http:
         # request download links in batches
         for start in range(0, len(files), batch_size):
             batch = files[start : start + batch_size]
             paths = [file["s3_path"] for file in batch]
-
-            # max 5 link requests every 30 seconds
-            if len(recent_calls) == 5:
-                elapsed = time.monotonic() - recent_calls[0]
-                if elapsed < 30.1:
-                    time.sleep(30.1 - elapsed)
-
-            recent_calls.append(time.monotonic())
 
             links = client.download_files_via_links(paths)
 
