@@ -106,37 +106,33 @@ def download_session(client: ExplorerClient, session_name: str, bucket, batch_si
         # Get the names and sizes of files already in this Supabase capture folder
         if folder not in stored_by_folder:
             stored_files = {}
-            offset = 0
+            page = bucket.list(
+                folder,
+                {
+                    "limit": 100,
+                    "offset": 0,
+                    "sortBy": {"column": "name", "order": "asc"},
+                },
+            )
 
-            while True:
-                page = bucket.list(
-                    folder,
-                    {
-                        "limit": 100,
-                        "offset": offset,
-                        "sortBy": {"column": "name", "order": "asc"},
-                    },
-                )
-
-                for item in page:
-                    metadata = item.get("metadata") or {}
-                    if metadata.get("size") is not None:
-                        stored_files[item["name"]] = metadata["size"]
-
-                if len(page) < 100:
-                    break
-
-                offset += len(page)
+            for item in page:
+                metadata = item.get("metadata") or {}
+                if metadata.get("size") is not None:
+                    stored_files[item["name"]] = metadata["size"]
 
             stored_by_folder[folder] = stored_files
 
         stored_files = stored_by_folder[folder]
 
-        # Skip the matching files before requesting download links
+        # Skip only if the stored size and saved source timestamp match
         if source.name in stored_files and stored_files[source.name] == file["size"]:
-            logger.info("Skipping existing file: %s", destination)
-            result["skipped"] += 1
-            continue
+            info = bucket.info(destination)
+            metadata = info.get("metadata") or {}
+
+            if (file["last_modified"] is not None and metadata.get("source_last_modified") == file["last_modified"]):
+                logger.info("Skipping existing file: %s", destination)
+                result["skipped"] += 1
+                continue
 
         pending.append(file)
 
@@ -180,6 +176,9 @@ def download_session(client: ExplorerClient, session_name: str, bucket, batch_si
                         file_options={
                             "content-type": content_type,
                             "upsert": "true",
+                            "metadata": {
+                                "source_last_modified": file["last_modified"], # Save kinatrax last_modified file metadata for comparisons on reruns
+                            },
                         },
                     )
 
