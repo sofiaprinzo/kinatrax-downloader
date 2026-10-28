@@ -61,16 +61,22 @@ class ExplorerClient:
         return listing
 
 
-def download_files_via_links(self, paths: list[str]) -> dict:
-    # No files to request
-    if not paths:
-        return {}
+    def download_files_via_links(self, paths: list[str]) -> dict:
+        # No files to request
+        if not paths:
+            return {}
 
-    # Ask KinaTrax for temporary download URLs
-    with self.request(
-        "download_files_via_links_v1",
-        paths=json.dumps(paths),
-    ) as response:
-        links = response.json()
+        # Ask KinaTrax for temporary download URLs
+        with self.request(
+            "download_files_via_links_v1",
+            file_paths = ",".join(paths)
+        ) as response:
+            results = response.json()
 
-    return links
+        links = {}
+        for entry in results:
+            source_path = entry["file_location"]
+            download_url = entry["link"]
+            links[source_path] = download_url
+
+        return links

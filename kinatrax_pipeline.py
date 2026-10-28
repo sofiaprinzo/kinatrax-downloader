@@ -3,6 +3,7 @@ from datetime import datetime
 import json
 import logging
 import os
+import mimetypes
 
 from pathlib import Path, PurePosixPath
 
@@ -10,6 +11,7 @@ from dotenv import load_dotenv
 import requests
 
 from kinatrax_api import ExplorerClient
+from supabase import create_client
 
 
 logger = logging.getLogger(__name__)
@@ -75,28 +77,79 @@ def list_session_files(client: ExplorerClient, session_path: str) -> list[dict]:
 
 
 def download_session(client: ExplorerClient, session_name: str, bucket, batch_size: int = 25,) -> dict:
-    # get all matching files for this session
-    files = list_session_files(client, session_name)
+    # Get all matching files for this session
+    timestamp = parse_session_name(session_name)
+    session_path = f"{SOURCE_ROOT}/{timestamp.year}/{session_name}/"
+    files = list_session_files(client, session_path)
 
-    logger.info("Preparing to download %s files", len(files))
+    if not files:
+        raise ValueError("No matching files found for this session")
 
     result = {
         "session": session_name,
         "files_found": len(files),
         "uploaded": 0,
+        "skipped": 0,
         "failed": 0,
         "bytes_uploaded": 0,
     }
 
+    pending = []
+    stored_by_folder = {}
+
+    for file in files:
+        source = PurePosixPath(file["s3_path"])
+        relative = source.relative_to(SOURCE_ROOT)
+        destination = f"staging/raw/{relative.as_posix()}"
+        folder = str(PurePosixPath(destination).parent)
+
+        # Get the names and sizes of files already in this Supabase capture folder
+        if folder not in stored_by_folder:
+            stored_files = {}
+            offset = 0
+
+            while True:
+                page = bucket.list(
+                    folder,
+                    {
+                        "limit": 100,
+                        "offset": offset,
+                        "sortBy": {"column": "name", "order": "asc"},
+                    },
+                )
+
+                for item in page:
+                    metadata = item.get("metadata") or {}
+                    if metadata.get("size") is not None:
+                        stored_files[item["name"]] = metadata["size"]
+
+                if len(page) < 100:
+                    break
+
+                offset += len(page)
+
+            stored_by_folder[folder] = stored_files
+
+        stored_files = stored_by_folder[folder]
+
+        # Skip the matching files before requesting download links
+        if source.name in stored_files and stored_files[source.name] == file["size"]:
+            logger.info("Skipping existing file: %s", destination)
+            result["skipped"] += 1
+            continue
+
+        pending.append(file)
+
+    logger.info("Preparing to download %s files", len(pending))
+
     with requests.Session() as download_http:
-        # request download links in batches
-        for start in range(0, len(files), batch_size):
-            batch = files[start : start + batch_size]
+        for start in range(0, len(pending), batch_size):
+            batch = pending[start : start + batch_size]
             paths = [file["s3_path"] for file in batch]
 
             links = client.download_files_via_links(paths)
 
-            # download each file and upload it to our bucket
+            # Download each file and upload it to Supabase bucket
             for file in batch:
                 s3_path = file["s3_path"]
                 url = links.get(s3_path)
@@ -109,38 +162,43 @@ def download_session(client: ExplorerClient, session_name: str, bucket, batch_si
                 try:
                     logger.info("Transferring %s", s3_path)
 
-                    with download_http.get(
-                        url,
-                        stream=True,
-                        timeout=(15, 120),
-                    ) as response:
+                    with download_http.get(url, timeout=(15, 120), allow_redirects=False) as response:
                         response.raise_for_status()
-                        response.raw.decode_content = True
+                        content = response.content
 
-                        # preserve original source folder structure
-                        bucket.upload_fileobj(
-                            response.raw,
-                            s3_path,
-                        )
+                    # Check the complete download before uploading it
+                    if len(content) != file["size"]:
+                        raise ValueError(f"Downloaded size differs from source listing: {s3_path}")
+
+                    relative = PurePosixPath(s3_path).relative_to(SOURCE_ROOT)
+                    destination = f"staging/raw/{relative.as_posix()}"
+                    content_type = mimetypes.guess_type(destination)[0] or "application/octet-stream"
+
+                    bucket.upload(
+                        file=content,
+                        path=destination,
+                        file_options={
+                            "content-type": content_type,
+                            "upsert": "true",
+                        },
+                    )
 
                     result["uploaded"] += 1
-                    result["bytes_uploaded"] += int(file["size"] or 0)
+                    result["bytes_uploaded"] += len(content)
 
                 except Exception as error:
-                    logger.error(
-                        "Failed to transfer %s: %s",
-                        s3_path,
-                        error,
-                    )
+                    logger.error("Failed to transfer %s: %s", s3_path, error)
                     result["failed"] += 1
 
     logger.info(
-        "Session complete: %s uploaded, %s failed",
+        "Session complete: %s uploaded, %s skipped, %s failed",
         result["uploaded"],
+        result["skipped"],
         result["failed"],
     )
 
     return result
+
 
 
 def main(argv=None) -> int:
@@ -150,6 +208,10 @@ def main(argv=None) -> int:
     # List session folder paths under a season year
     # Ex: For Data/CPS/2026/ run 'python3 kinatrax_pipeline.py --season 2026'
     commands.add_argument("--season", type=int)
+
+    # Transfer one session to Supabase storage bucket
+    # Ex: run 'python3 kinatrax_pipeline.py --session 2026_10_27_15_11_21'
+    commands.add_argument("--session")
 
     # Show one folder's immediate folders, files, and file metadata
     # Ex: run 'python3 kinatrax_pipeline.py --path Data/CPS/2026/'
@@ -170,6 +232,13 @@ def main(argv=None) -> int:
             client = ExplorerClient(api_key, base_url, http)
             if args.season is not None:
                 result = list_sessions(client, args.season)
+            elif args.session is not None:
+                supabase = create_client(
+                    os.environ["SUPABASE_URL"],
+                    os.environ["SUPABASE_SECRET_KEY"],
+                )
+                bucket = supabase.storage.from_(os.environ["SUPABASE_BUCKET"])
+                result = download_session(client, args.session, bucket)
             else:
                 result = client.list_folder(args.path)
             print(json.dumps(result, indent=2))
