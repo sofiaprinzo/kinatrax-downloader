@@ -1,5 +1,5 @@
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -200,6 +200,49 @@ def download_session(client: ExplorerClient, session_name: str, bucket, batch_si
 
 
 
+def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) -> dict:
+    timestamp = parse_session_name(session_name)
+    s3_path = f"{SOURCE_ROOT}/{timestamp.year}/{session_name}/"
+    table = supabase.table("kinatrax_ingest_log")
+
+    # Skips completed sessions before listing folders/transferring files
+    existing = (
+        table.select("status")
+        .eq("session_name", session_name)
+        .maybe_single()
+        .execute()
+    )
+    if existing is not None and existing.data["status"] == "downloaded":
+        logger.info("Session already downloaded. Skipping: %s", session_name)
+        return {
+            "session": session_name,
+            "status": "downloaded",
+            "skipped_session": True,
+        }
+
+    try:
+        result = download_session(client, session_name, bucket)
+    except Exception as error:
+        logger.error("Session failed: %s: %s", session_name, error)
+        result = {
+            "session": session_name,
+            "status": "failed",
+        }
+    else:
+        result["status"] = "failed" if result["failed"] > 0 else "downloaded"
+
+    # Save latest outcome for this session
+    record = {
+        "session_name": session_name,
+        "s3_path": s3_path,
+        "file_count": result.get("files_found"),
+        "downloaded_at": datetime.now(timezone.utc).isoformat() if result["status"] == "downloaded" else None,
+        "status": result["status"],
+    }
+    table.upsert(record, on_conflict = "session_name").execute()
+    return result
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     commands = parser.add_mutually_exclusive_group(required=True)
@@ -237,10 +280,13 @@ def main(argv=None) -> int:
                     os.environ["SUPABASE_SECRET_KEY"],
                 )
                 bucket = supabase.storage.from_(os.environ["SUPABASE_BUCKET"])
-                result = download_session(client, args.session, bucket)
+                result = ingest_session(client, args.session, bucket, supabase)
             else:
                 result = client.list_folder(args.path)
             print(json.dumps(result, indent=2))
+
+        if args.session is not None and result["status"] == "failed":
+            return 1
         return 0
 
     except requests.HTTPError as error:
