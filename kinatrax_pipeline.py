@@ -1,5 +1,5 @@
 import argparse
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import logging
 import os
@@ -42,46 +42,55 @@ def list_sessions(client: ExplorerClient, season: int) -> list[str]:
     return sorted(set(sessions))
 
 # Find the data files inside each Pitching and Batting capture folder
-def list_session_files(client: ExplorerClient, session_path: str) -> list[dict]:
+def list_session_files(client: ExplorerClient, session_path: str, discovery_state: dict) -> list[dict]:
     session = PurePosixPath(session_path)
-    captures = []
-    logger.info("Listing session: %s", session.name)
-    session_listing = client.list_folder(f"{session}/")
-    for activity_path in sorted(session_listing["folders"]):
-        activity = PurePosixPath(activity_path)
-        if activity.name in {"Pitching", "Batting"}:
-            logger.info("Listing activity: %s", activity.name)
-            activity_listing = client.list_folder(f"{activity}/")
-            captures.extend(activity_listing["folders"])
 
-    # Only check files directly inside the capture folder, not its subfolders. The subfolders only have video files
-    files = []
-    logger.info("Found %s capture folders", len(captures))
-    for capture_path in sorted(captures):
-        capture = PurePosixPath(capture_path)
-        logger.info("Listing capture: %s", capture.name)
+    if discovery_state["remaining_captures"] is None:
+        captures = []
+        logger.info("Listing session: %s", session.name)
+        session_listing = client.list_folder(f"{session}/")
+        for activity_path in sorted(session_listing["folders"]):
+            activity = PurePosixPath(activity_path)
+            if activity.name in {"Pitching", "Batting"}:
+                logger.info("Listing activity: %s", activity.name)
+                activity_listing = client.list_folder(f"{activity}/")
+                captures.extend(activity_listing["folders"])
+
+        discovery_state["remaining_captures"] = sorted(captures)
+        logger.info("Found %s capture folders", len(captures))
+    elif discovery_state["remaining_captures"]:
+        logger.info("Resuming discovery for session %s: %s capture folders remaining", session.name, len(discovery_state["remaining_captures"]))
+
+    total_captures = len(discovery_state["remaining_captures"])
+    while discovery_state["remaining_captures"]:
+        capture = PurePosixPath(discovery_state["remaining_captures"][0])
+        capture_number = total_captures - len(discovery_state["remaining_captures"]) + 1
+        logger.info("Listing capture %s/%s: %s", capture_number, total_captures, capture.name)
         listing = client.list_folder(f"{capture}/")
         metadata_by_path = listing["metadata"]
+        capture_files = []
+
+        # Only check files directly inside the capture folder, not its subfolders. The subfolders only have video files
         for file_path in listing["files"]:
-            path = PurePosixPath(file_path)
-            if path.suffix.lower() in DATA_EXTENSIONS and path.name not in EXCLUDED_FILENAMES:
+            file = PurePosixPath(file_path)
+            if file.suffix.lower() in DATA_EXTENSIONS and file.name not in EXCLUDED_FILENAMES:
                 metadata = metadata_by_path.get(file_path, {})
-                files.append({
+                capture_files.append({
                     "s3_path": file_path,
                     "size": metadata.get("size"),
                     "last_modified": metadata.get("last_modified"),
                 })
 
+        # After listing this capture, update its state: add its files and remove it from the remaining captures
+        discovery_state["files"].extend(capture_files)
+        discovery_state["remaining_captures"].pop(0)
+
+    files = discovery_state["files"]
     logger.info("Found %s matching data files", len(files))
     return sorted(files, key=lambda file: file["s3_path"])
 
 
-def download_session(client: ExplorerClient, session_name: str, bucket, batch_size: int = 25,) -> dict:
-    # Get all matching files for this session
-    timestamp = parse_session_name(session_name)
-    session_path = f"{SOURCE_ROOT}/{timestamp.year}/{session_name}/"
-    files = list_session_files(client, session_path)
-
+def download_session(client: ExplorerClient, session_name: str, bucket, files: list[dict], transfer_state: list[str], batch_size: int = 10) -> dict:
     if not files:
         raise ValueError("No matching files found for this session")
 
@@ -94,46 +103,14 @@ def download_session(client: ExplorerClient, session_name: str, bucket, batch_si
         "bytes_uploaded": 0,
     }
 
+    # Use saved transfer state to skip files already uploaded
+    uploaded_paths = set(transfer_state)
     pending = []
-    stored_by_folder = {}
-
     for file in files:
-        source = PurePosixPath(file["s3_path"])
-        relative = source.relative_to(SOURCE_ROOT)
-        destination = f"staging/raw/{relative.as_posix()}"
-        folder = str(PurePosixPath(destination).parent)
-
-        # Get the names and sizes of files already in this Supabase capture folder
-        if folder not in stored_by_folder:
-            stored_files = {}
-            page = bucket.list(
-                folder,
-                {
-                    "limit": 100,
-                    "offset": 0,
-                    "sortBy": {"column": "name", "order": "asc"},
-                },
-            )
-
-            for item in page:
-                metadata = item.get("metadata") or {}
-                if metadata.get("size") is not None:
-                    stored_files[item["name"]] = metadata["size"]
-
-            stored_by_folder[folder] = stored_files
-
-        stored_files = stored_by_folder[folder]
-
-        # Skip only if the stored size and saved source timestamp match
-        if source.name in stored_files and stored_files[source.name] == file["size"]:
-            info = bucket.info(destination)
-            metadata = info.get("metadata") or {}
-
-            if (file["last_modified"] is not None and metadata.get("source_last_modified") == file["last_modified"]):
-                logger.info("Skipping existing file: %s", destination)
-                result["skipped"] += 1
-                continue
-
+        if file["s3_path"] in uploaded_paths:
+            logger.info("Skipping existing file: %s", file["s3_path"])
+            result["skipped"] += 1
+            continue
         pending.append(file)
 
     logger.info("Preparing to download %s files", len(pending))
@@ -145,7 +122,7 @@ def download_session(client: ExplorerClient, session_name: str, bucket, batch_si
 
             links = client.download_files_via_links(paths)
 
-            # Download each file and upload it to Supabase bucket
+            # Download each file from requested batch and upload it to Supabase bucket
             for file in batch:
                 s3_path = file["s3_path"]
                 url = links.get(s3_path)
@@ -177,11 +154,12 @@ def download_session(client: ExplorerClient, session_name: str, bucket, batch_si
                             "content-type": content_type,
                             "upsert": "true",
                             "metadata": {
-                                "source_last_modified": file["last_modified"], # Save kinatrax last_modified file metadata for comparisons on reruns
+                                "source_last_modified": file["last_modified"],
                             },
                         },
                     )
 
+                    transfer_state.append(s3_path)
                     result["uploaded"] += 1
                     result["bytes_uploaded"] += len(content)
 
@@ -205,13 +183,13 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
     s3_path = f"{SOURCE_ROOT}/{timestamp.year}/{session_name}/"
     table = supabase.table("kinatrax_ingest_log")
 
-    # Skips completed sessions before listing folders/transferring files
     existing = (
-        table.select("status")
+        table.select("status, discovery_state, transfer_state")
         .eq("session_name", session_name)
         .maybe_single()
         .execute()
     )
+
     if existing is not None and existing.data["status"] == "downloaded":
         logger.info("Session already downloaded. Skipping: %s", session_name)
         return {
@@ -220,8 +198,48 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
             "skipped_session": True,
         }
 
+    # Load saved discovery state or start fresh
+    discovery_state = existing.data["discovery_state"] if existing is not None else None
+
+    if discovery_state is None:
+        discovery_state = {
+            "remaining_captures": None,
+            "files": [],
+        }
+
+    # Load saved transfer state or start fresh
+    transfer_state = existing.data["transfer_state"] if existing is not None else None
+    if transfer_state is None:
+        transfer_state = []
+
+    record = {
+        "session_name": session_name,
+        "s3_path": s3_path,
+        "file_count": len(discovery_state["files"]) if discovery_state["remaining_captures"] == [] else None,
+        "downloaded_at": None,
+        "status": "failed",
+        "discovery_state": discovery_state,
+        "transfer_state": transfer_state,
+    }
+
+    # Discover files
     try:
-        result = download_session(client, session_name, bucket)
+        if discovery_state["remaining_captures"] == []:
+            logger.info("Discovery already complete for session %s. Reusing saved file paths.", session_name)
+
+        files = list_session_files(client, s3_path, discovery_state)
+
+        if not files:
+            record["discovery_state"] = None
+            raise ValueError("No matching files found for this session")
+
+        # Save the complete file list before transfers
+        record["file_count"] = len(files)
+        table.upsert(record, on_conflict = "session_name").execute()
+
+        # Transfer files to storage
+        result = download_session(client, session_name, bucket, files, transfer_state)
+
     except Exception as error:
         logger.error("Session failed: %s: %s", session_name, error)
         result = {
@@ -231,37 +249,33 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
     else:
         result["status"] = "failed" if result["failed"] > 0 else "downloaded"
 
-    # Save latest outcome for this session
-    record = {
-        "session_name": session_name,
-        "s3_path": s3_path,
-        "file_count": result.get("files_found"),
-        "downloaded_at": datetime.now(timezone.utc).isoformat() if result["status"] == "downloaded" else None,
-        "status": result["status"],
-    }
+    record["status"] = result["status"]
+
+    if result["status"] == "downloaded":
+        record["downloaded_at"] = datetime.now(timezone.utc).isoformat()
+        record["discovery_state"] = None
+        record["transfer_state"] = None
+
     table.upsert(record, on_conflict = "session_name").execute()
     return result
 
 
-def main(argv=None) -> int:
+def main() -> int:
     parser = argparse.ArgumentParser()
     commands = parser.add_mutually_exclusive_group(required=True)
 
-    # List session folder paths under a season year
-    # Ex: For Data/CPS/2026/ run 'python3 kinatrax_pipeline.py --season 2026'
-    commands.add_argument("--season", type=int)
-
-    # Transfer one session to Supabase storage bucket
-    # Ex: run 'python3 kinatrax_pipeline.py --session 2026_10_27_15_11_21'
-    commands.add_argument("--session")
+    # Ex: run 'python3 kinatrax_pipeline.py --backfill 2026-09-18 2026-12-31'
+    commands.add_argument("--backfill", nargs=2, type=date.fromisoformat)
 
     # Show one folder's immediate folders, files, and file metadata
     # Ex: run 'python3 kinatrax_pipeline.py --path Data/CPS/2026/'
     commands.add_argument("--path")
 
-    args = parser.parse_args(argv)
-    if args.season is not None and not 1000 <= args.season <= 9999:
-        parser.error("--season must be a four-digit source directory year")
+    args = parser.parse_args()
+    if args.backfill is not None:
+        start_date, end_date = args.backfill
+        if start_date > end_date:
+            parser.error("start_date must be on or before end_date")
 
     logging.basicConfig(level=logging.INFO)
 
@@ -272,27 +286,33 @@ def main(argv=None) -> int:
     try:
         with requests.Session() as http:
             client = ExplorerClient(api_key, base_url, http)
-            if args.season is not None:
-                result = list_sessions(client, args.season)
-            elif args.session is not None:
+            if args.backfill is not None:
                 supabase = create_client(
                     os.environ["SUPABASE_URL"],
                     os.environ["SUPABASE_SECRET_KEY"],
                 )
                 bucket = supabase.storage.from_(os.environ["SUPABASE_BUCKET"])
-                result = ingest_session(client, args.session, bucket, supabase)
+                results = []
+                for season in range(start_date.year, end_date.year + 1):
+                    for session_path in list_sessions(client, season):
+                        session_name = PurePosixPath(session_path).name
+                        session_date = parse_session_name(session_name).date()
+                        if start_date <= session_date <= end_date:
+                            result = ingest_session(client, session_name, bucket, supabase)
+                            results.append(result)
+                result = results
             else:
                 result = client.list_folder(args.path)
             print(json.dumps(result, indent=2))
 
-        if args.session is not None and result["status"] == "failed":
+        if args.backfill is not None and any(session["status"] == "failed" for session in result):
             return 1
         return 0
 
     except requests.HTTPError as error:
-        logger.error("Explorer request failed (HTTP %s).", error.response.status_code)
-    except requests.RequestException:
-        logger.error("Explorer request failed: Check connection and API access")
+        logger.error("Explorer request failed (HTTP %s).", error)
+    except requests.RequestException as error:
+        logger.error("Explorer request failed: %s", error)
     except (ValueError, TypeError) as error:
         logger.error("%s", error)
     return 1
