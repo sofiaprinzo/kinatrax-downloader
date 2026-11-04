@@ -41,22 +41,31 @@ def list_sessions(client: ExplorerClient, season: int) -> list[str]:
         sessions.append(folder)
     return sorted(set(sessions))
 
+
 # Find the data files inside each Pitching and Batting capture folder
-def list_session_files(client: ExplorerClient, session_path: str, discovery_state: dict) -> list[dict]:
+def list_session_files(client: ExplorerClient, session_path: str, discovery_state: dict, save_discovery) -> list[dict]:
     session = PurePosixPath(session_path)
 
     if discovery_state["remaining_captures"] is None:
         captures = []
         logger.info("Listing session: %s", session.name)
         session_listing = client.list_folder(f"{session}/")
+        # Stop if the listing has additional pages
+        if session_listing["has_more"]:
+            raise ValueError("Session listing has more pages")
         for activity_path in sorted(session_listing["folders"]):
             activity = PurePosixPath(activity_path)
             if activity.name in {"Pitching", "Batting"}:
                 logger.info("Listing activity: %s", activity.name)
                 activity_listing = client.list_folder(f"{activity}/")
+                # Stop if the listing has additional pages
+                if activity_listing["has_more"]:
+                    raise ValueError("Activity listing has more pages")
                 captures.extend(activity_listing["folders"])
 
         discovery_state["remaining_captures"] = sorted(captures)
+        # Save the folders we still need to list
+        save_discovery()
         logger.info("Found %s capture folders", len(captures))
     elif discovery_state["remaining_captures"]:
         logger.info("Resuming discovery for session %s: %s capture folders remaining", session.name, len(discovery_state["remaining_captures"]))
@@ -67,6 +76,9 @@ def list_session_files(client: ExplorerClient, session_path: str, discovery_stat
         capture_number = total_captures - len(discovery_state["remaining_captures"]) + 1
         logger.info("Listing capture %s/%s: %s", capture_number, total_captures, capture.name)
         listing = client.list_folder(f"{capture}/")
+        # Stop if the listing has additional pages
+        if listing["has_more"]:
+            raise ValueError("Capture listing has more pages")
         metadata_by_path = listing["metadata"]
         capture_files = []
 
@@ -84,13 +96,17 @@ def list_session_files(client: ExplorerClient, session_path: str, discovery_stat
         # After listing this capture, update its state: add its files and remove it from the remaining captures
         discovery_state["files"].extend(capture_files)
         discovery_state["remaining_captures"].pop(0)
+        # Save completed capture progress
+        save_discovery()
 
     files = discovery_state["files"]
     logger.info("Found %s matching data files", len(files))
     return sorted(files, key=lambda file: file["s3_path"])
 
 
-def download_session(client: ExplorerClient, session_name: str, bucket, files: list[dict], transfer_state: list[str], batch_size: int = 10) -> dict:
+def download_session(
+    client: ExplorerClient, session_name: str, bucket, files: list[dict], transfer_state: list[str], save_transfer, batch_size: int = 10
+) -> dict:
     if not files:
         raise ValueError("No matching files found for this session")
 
@@ -160,6 +176,10 @@ def download_session(client: ExplorerClient, session_name: str, bucket, files: l
                     )
 
                     transfer_state.append(s3_path)
+
+                    # Save the file as uploaded
+                    save_transfer()
+
                     result["uploaded"] += 1
                     result["bytes_uploaded"] += len(content)
 
@@ -177,7 +197,6 @@ def download_session(client: ExplorerClient, session_name: str, bucket, files: l
     return result
 
 
-
 def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) -> dict:
     timestamp = parse_session_name(session_name)
     s3_path = f"{SOURCE_ROOT}/{timestamp.year}/{session_name}/"
@@ -190,7 +209,10 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
         .execute()
     )
 
-    if existing is not None and existing.data["status"] == "downloaded":
+    # Get the saved session data if it exists
+    existing_data = existing_data if existing is not None else None
+
+    if existing_data is not None and existing_data["status"] == "downloaded":
         logger.info("Session already downloaded. Skipping: %s", session_name)
         return {
             "session": session_name,
@@ -199,7 +221,7 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
         }
 
     # Load saved discovery state or start fresh
-    discovery_state = existing.data["discovery_state"] if existing is not None else None
+    discovery_state = existing_data["discovery_state"] if existing_data is not None else None
 
     if discovery_state is None:
         discovery_state = {
@@ -208,7 +230,7 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
         }
 
     # Load saved transfer state or start fresh
-    transfer_state = existing.data["transfer_state"] if existing is not None else None
+    transfer_state = existing_data["transfer_state"] if existing_data is not None else None
     if transfer_state is None:
         transfer_state = []
 
@@ -222,12 +244,23 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
         "transfer_state": transfer_state,
     }
 
+    # Create the record before starting
+    table.upsert(record, on_conflict="session_name").execute()
+
+    def save_discovery():
+        # Save the current folder listing progress
+        table.update({"discovery_state": discovery_state}).eq("session_name", session_name).execute()
+
+    def save_transfer():
+        # Save the files already uploaded
+        table.update({"transfer_state": transfer_state}).eq("session_name", session_name).execute()
+
     # Discover files
     try:
         if discovery_state["remaining_captures"] == []:
             logger.info("Discovery already complete for session %s. Reusing saved file paths.", session_name)
 
-        files = list_session_files(client, s3_path, discovery_state)
+        files = list_session_files(client, s3_path, discovery_state, save_discovery)
 
         if not files:
             record["discovery_state"] = None
@@ -238,7 +271,7 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
         table.upsert(record, on_conflict = "session_name").execute()
 
         # Transfer files to storage
-        result = download_session(client, session_name, bucket, files, transfer_state)
+        result = download_session(client, session_name, bucket, files, transfer_state, save_transfer)
 
     except Exception as error:
         logger.error("Session failed: %s: %s", session_name, error)
