@@ -6,7 +6,7 @@ from pathlib import PurePosixPath
 import requests
 import json
 
-REQUEST_INTERVAL = 6.1  # Account limit says 5 calls per 30 seconds, added +0.1s for safety
+REQUEST_INTERVAL = 1.1  # Account limit says 30 calls per 30 seconds, added +0.1s for safety
 REQUEST_TIMEOUT = 30
 
 

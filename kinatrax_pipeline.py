@@ -5,6 +5,8 @@ import logging
 import os
 import mimetypes
 
+import time
+
 from pathlib import Path, PurePosixPath
 
 from dotenv import load_dotenv
@@ -151,9 +153,38 @@ def download_session(
                 try:
                     logger.info("Transferring %s", s3_path)
 
-                    with download_http.get(url, timeout=(15, 120), allow_redirects=False) as response:
-                        response.raise_for_status()
-                        content = response.content
+                    # Retry failed S3 downloads up to 3 times
+                    for attempt in range(3):
+                        try:
+                            # Get a new URL when retrying
+                            if attempt > 0:
+                                url = client.download_files_via_links([s3_path]).get(s3_path)
+
+                                if not url:
+                                    raise ValueError(f"No download URL for {s3_path}")
+
+                            with download_http.get(
+                                url,
+                                timeout=(15, 120),
+                                allow_redirects=False
+                            ) as response:
+                                response.raise_for_status()
+                                content = response.content
+
+                            break
+
+                        except (requests.Timeout, requests.ConnectionError, requests.HTTPError):
+                            if attempt == 2:
+                                raise
+
+                            logger.warning(
+                                "S3 download failed for %s, retrying (%s/3)",
+                                s3_path,
+                                attempt + 1,
+                            )
+
+                            # Wait before retrying
+                            time.sleep(2 ** attempt)
 
                     # Check the complete download before uploading it
                     if len(content) != file["size"]:
