@@ -6,7 +6,7 @@ from pathlib import PurePosixPath
 import requests
 import json
 
-REQUEST_INTERVAL = 1.1  # Account limit says 30 calls per 30 seconds, added +0.1s for safety
+REQUEST_INTERVAL = 1.1  # Account limit is 30 calls per 30 seconds, added +0.1s for safety
 REQUEST_TIMEOUT = 30
 
 
@@ -20,7 +20,6 @@ class ExplorerClient:
         self.last_request = None
 
     # Pace the query calls to be consistent with request interval
-    # Will add failure retries later
     def request(self, endpoint: str, **parameters) -> requests.Response:
         if self.last_request is not None:
             elapsed = time.monotonic() - self.last_request
@@ -57,6 +56,9 @@ class ExplorerClient:
         missing_keys = {"folders", "files", "metadata", "has_more"} - listing.keys()
         if missing_keys:
             raise ValueError(f"Missing listing fields: {', '.join(sorted(missing_keys))}")
+
+        if listing["has_more"]:
+            raise ValueError(f"Folder listing is incomplete: has_more = True. {path}")
 
         return listing
 

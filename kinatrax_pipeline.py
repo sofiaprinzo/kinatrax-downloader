@@ -1,10 +1,9 @@
 import argparse
-from datetime import date, datetime, timezone
 import json
+from datetime import date, datetime, timezone
 import logging
 import os
 import mimetypes
-
 import time
 
 from pathlib import Path, PurePosixPath
@@ -13,6 +12,7 @@ from dotenv import load_dotenv
 import requests
 
 from kinatrax_api import ExplorerClient
+from kinatrax_logging import configure_logging
 from supabase import create_client
 
 
@@ -52,17 +52,11 @@ def list_session_files(client: ExplorerClient, session_path: str, discovery_stat
         captures = []
         logger.info("Listing session: %s", session.name)
         session_listing = client.list_folder(f"{session}/")
-        # Stop if the listing has additional pages
-        if session_listing["has_more"]:
-            raise ValueError("Session listing has more pages")
         for activity_path in sorted(session_listing["folders"]):
             activity = PurePosixPath(activity_path)
             if activity.name in {"Pitching", "Batting"}:
                 logger.info("Listing activity: %s", activity.name)
                 activity_listing = client.list_folder(f"{activity}/")
-                # Stop if the listing has additional pages
-                if activity_listing["has_more"]:
-                    raise ValueError("Activity listing has more pages")
                 captures.extend(activity_listing["folders"])
 
         discovery_state["remaining_captures"] = sorted(captures)
@@ -78,9 +72,6 @@ def list_session_files(client: ExplorerClient, session_path: str, discovery_stat
         capture_number = total_captures - len(discovery_state["remaining_captures"]) + 1
         logger.info("Listing capture %s/%s: %s", capture_number, total_captures, capture.name)
         listing = client.list_folder(f"{capture}/")
-        # Stop if the listing has additional pages
-        if listing["has_more"]:
-            raise ValueError("Capture listing has more pages")
         metadata_by_path = listing["metadata"]
         capture_files = []
 
@@ -119,6 +110,7 @@ def download_session(
         "skipped": 0,
         "failed": 0,
         "bytes_uploaded": 0,
+        "error_message": None,
     }
 
     # Use saved transfer state to skip files already uploaded
@@ -146,8 +138,11 @@ def download_session(
                 url = links.get(s3_path)
 
                 if not url:
-                    logger.error("No download URL for %s", s3_path)
+                    message = f"No download URL for {s3_path}"
+                    logger.error(message)
                     result["failed"] += 1
+                    if result["error_message"] is None:
+                        result["error_message"] = message
                     continue
 
                 try:
@@ -215,8 +210,11 @@ def download_session(
                     result["bytes_uploaded"] += len(content)
 
                 except Exception as error:
-                    logger.error("Failed to transfer %s: %s", s3_path, error)
+                    message = f"Failed to transfer {s3_path}: {error}"
+                    logger.error(message)
                     result["failed"] += 1
+                    if result["error_message"] is None:
+                        result["error_message"] = message
 
     logger.info(
         "Session complete: %s uploaded, %s skipped, %s failed",
@@ -241,7 +239,7 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
     )
 
     # Get the saved session data if it exists
-    existing_data = existing_data if existing is not None else None
+    existing_data = existing.data if existing is not None else None
 
     if existing_data is not None and existing_data["status"] == "downloaded":
         logger.info("Session already downloaded. Skipping: %s", session_name)
@@ -273,6 +271,7 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
         "status": "failed",
         "discovery_state": discovery_state,
         "transfer_state": transfer_state,
+        "error_message": None,
     }
 
     # Create the record before starting
@@ -305,15 +304,18 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
         result = download_session(client, session_name, bucket, files, transfer_state, save_transfer)
 
     except Exception as error:
-        logger.error("Session failed: %s: %s", session_name, error)
+        message = f"Session failed: {session_name}: {error}"
+        logger.error(message)
         result = {
             "session": session_name,
             "status": "failed",
+            "error_message": message,
         }
     else:
         result["status"] = "failed" if result["failed"] > 0 else "downloaded"
 
     record["status"] = result["status"]
+    record["error_message"] = result["error_message"]
 
     if result["status"] == "downloaded":
         record["downloaded_at"] = datetime.now(timezone.utc).isoformat()
@@ -335,15 +337,20 @@ def main() -> int:
     # Ex: run 'python3 kinatrax_pipeline.py --path Data/CPS/2026/'
     commands.add_argument("--path")
 
+    parser.add_argument("--log-file", type=Path)
+
     args = parser.parse_args()
     if args.backfill is not None:
         start_date, end_date = args.backfill
         if start_date > end_date:
             parser.error("start_date must be on or before end_date")
-
-    logging.basicConfig(level=logging.INFO)
+        if args.log_file is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            args.log_file = PROJECT_DIR / "logs" / f"kinatrax_extraction_backfill_{start_date}_to_{end_date}_run{timestamp}.log"
 
     load_dotenv(PROJECT_DIR / ".env")
+    configure_logging(args.log_file)
+
     api_key = os.getenv("KINATRAX_API_KEY", "")
     base_url = os.getenv("KINATRAX_BASE_URL", "https://explorer-api.kinatrax.com")
 
@@ -367,7 +374,7 @@ def main() -> int:
                 result = results
             else:
                 result = client.list_folder(args.path)
-            print(json.dumps(result, indent=2))
+            logger.info("Run result:\n%s", json.dumps(result, indent=2))
 
         if args.backfill is not None and any(session["status"] == "failed" for session in result):
             return 1
@@ -383,4 +390,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        logger.error("%s", error)
+        raise SystemExit(1)
