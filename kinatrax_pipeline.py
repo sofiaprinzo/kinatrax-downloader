@@ -133,7 +133,7 @@ def download_session(
             links = client.download_files_via_links(paths)
 
             # Download each file from requested batch and upload it to Supabase bucket
-            for file in batch:
+            for file_number, file in enumerate(batch, start = start + 1):
                 s3_path = file["s3_path"]
                 url = links.get(s3_path)
 
@@ -146,7 +146,7 @@ def download_session(
                     continue
 
                 try:
-                    logger.info("Transferring %s", s3_path)
+                    logger.info("Transferring %s/%s: %s", file_number, len(pending), s3_path)
 
                     # Retry failed S3 downloads up to 3 times
                     for attempt in range(3):
@@ -268,7 +268,7 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
         "s3_path": s3_path,
         "file_count": len(discovery_state["files"]) if discovery_state["remaining_captures"] == [] else None,
         "downloaded_at": None,
-        "status": "failed",
+        "status": "in_progress",
         "discovery_state": discovery_state,
         "transfer_state": transfer_state,
         "error_message": None,
