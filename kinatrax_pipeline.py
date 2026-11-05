@@ -241,7 +241,7 @@ def ingest_session(client: ExplorerClient, session_name: str, bucket, supabase) 
     )
 
     # Get the saved session data if it exists
-    existing_data = existing_data if existing is not None else None
+    existing_data = existing.data if existing is not None else None
 
     if existing_data is not None and existing_data["status"] == "downloaded":
         logger.info("Session already downloaded. Skipping: %s", session_name)
